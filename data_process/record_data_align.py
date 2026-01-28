@@ -1,0 +1,109 @@
+# Need to further process the collected data and process it
+# Cut the frames and align the data, and create the video for each camera with the fps 30
+import os
+import json
+from argparse import ArgumentParser
+
+num_cameras = 3
+
+parser = ArgumentParser()
+parser.add_argument(
+    "--base_path",
+    type=str,
+    default="/home/hanxiao/Desktop/Research/proj-qqtt/proj-QQTT/past_data_collect/different_types",
+)
+parser.add_argument("--case_name", type=str)
+parser.add_argument(
+    "--output_path",
+    type=str,
+    default="/home/hanxiao/Desktop/Research/proj-qqtt/proj-QQTT/data/different_types",
+)
+parser.add_argument("--start", type=int)
+parser.add_argument("--end", type=int)
+args = parser.parse_args()
+
+base_path = args.base_path
+case_name = args.case_name
+output_path = args.output_path
+start_step = args.start
+end_step = args.end
+
+calibrate_path = f"{base_path}/{case_name}/calibrate.pkl"
+
+
+FPS = 30
+
+
+def exist_dir(dir):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
+
+if __name__ == "__main__":
+    new_metadata = {}
+
+    with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
+        data = json.load(f)
+
+    new_metadata["intrinsics"] = data["intrinsics"]
+    new_metadata["serial_numbers"] = data["serial_numbers"]
+    new_metadata["fps"] = data["fps"]
+    new_metadata["WH"] = data["WH"]
+
+    frame_num = 0
+    step_timestamps = data["recording"]
+    final_frames = []
+    # Get all frames of camera 0 between start_step and end_step
+    # And match the timestamps of other cameras
+    for i in step_timestamps["0"].keys():
+        if int(i) >= start_step and int(i) <= end_step:
+            frame_num += 1
+            timestamp = step_timestamps["0"][i]
+            current_frame = [int(i)]
+            for j in range(1, num_cameras):
+                # Search the adjacent step_idx and get the most close timestamp
+                potential_timestamps = []
+                step_idx = int(i)
+                min_diff = 10
+                best_idx = None
+                for k in range(-3, 4):
+                    if str(step_idx + k) in step_timestamps[str(j)]:
+                        diff = abs(
+                            step_timestamps[str(j)][str(step_idx + k)] - timestamp
+                        )
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_idx = step_idx + k
+                current_frame.append(best_idx)
+            final_frames.append(current_frame)
+
+    new_metadata["frame_num"] = frame_num
+    new_metadata["start_step"] = start_step
+    new_metadata["end_step"] = end_step
+    # Move the files into a final data format
+    exist_dir(f"{output_path}")
+    exist_dir(f"{output_path}/{case_name}")
+    exist_dir(f"{output_path}/{case_name}/color")
+    exist_dir(f"{output_path}/{case_name}/depth")
+    for i in range(num_cameras):
+        exist_dir(f"{output_path}/{case_name}/color/{i}")
+        exist_dir(f"{output_path}/{case_name}/depth/{i}")
+
+    os.system(f"cp {calibrate_path} {output_path}/{case_name}")
+
+    with open(f"{output_path}/{case_name}/metadata.json", "w") as f:
+        json.dump(new_metadata, f)
+    for k, frame in enumerate(final_frames):
+        for i in range(num_cameras):
+            os.system(
+                f"cp {base_path}/{case_name}/color/{i}/{frame[i]}.png {output_path}/{case_name}/color/{i}/{k}.png"
+            )
+            os.system(
+                f"cp {base_path}/{case_name}/depth/{i}/{frame[i]}.npy {output_path}/{case_name}/depth/{i}/{k}.npy"
+            )
+
+    # for each camera, create a video for all frames with the fps 30
+    for i in range(num_cameras):
+        os.system(
+            f"ffmpeg -r {FPS} -start_number 0 -f image2 -i {output_path}/{case_name}/color/{i}/%d.png -vcodec libx264 -crf 0  -pix_fmt yuv420p {output_path}/{case_name}/color/{i}.mp4"
+        )
