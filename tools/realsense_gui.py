@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -21,12 +22,10 @@ def _start_pipeline(
     *,
     ctx: rs.context,
     serial: str,
-    width: int,
-    height: int,
-    fps_candidates: Tuple[int, ...],
-) -> Tuple[rs.pipeline, int]:
+    profiles: Tuple[Tuple[int, int, int], ...],
+) -> Tuple[rs.pipeline, Tuple[int, int, int]]:
     last_err: Optional[BaseException] = None
-    for fps in fps_candidates:
+    for width, height, fps in profiles:
         pipeline = rs.pipeline(ctx)
         config = rs.config()
         config.enable_device(serial)
@@ -45,7 +44,7 @@ def _start_pipeline(
                     last_err = e
             if not ok:
                 raise RuntimeError(f"Frame didn't arrive after starting {width}x{height}@{fps}")
-            return pipeline, fps
+            return pipeline, (width, height, fps)
         except Exception as e:
             last_err = e
             try:
@@ -53,7 +52,58 @@ def _start_pipeline(
             except Exception:
                 pass
             print(f"[WARN] Failed to start {width}x{height}@{fps}: {type(e).__name__}: {e}")
-    raise RuntimeError(f"Failed to start pipeline with candidates={fps_candidates}: {last_err}")
+            # Give libusb a brief chance to release interfaces before retry.
+            time.sleep(0.2)
+    raise RuntimeError(f"Failed to start pipeline with candidates={profiles}: {last_err}")
+
+
+def _build_profiles(
+    *,
+    req_width: int,
+    req_height: int,
+    req_fps: int,
+    usb_desc: str,
+    total_cams: int,
+) -> Tuple[Tuple[int, int, int], ...]:
+    profiles: List[Tuple[int, int, int]] = []
+
+    if total_cams >= 3:
+        # In 3-camera mode under WSL/usbip, start conservatively first.
+        profiles.extend(
+            [
+                (848, 480, 15),
+                (640, 480, 15),
+                (640, 480, 5),
+                (req_width, req_height, 15),
+                (req_width, req_height, 5),
+                (848, 480, 30),
+                (req_width, req_height, req_fps),
+            ]
+        )
+    else:
+        # Try requested profile first (or safer fps for USB2).
+        if usb_desc.startswith("2"):
+            profiles.append((req_width, req_height, min(req_fps, 15)))
+        else:
+            profiles.append((req_width, req_height, req_fps))
+        profiles.extend(
+            [
+                (848, 480, 15),
+                (848, 480, 5),
+                (640, 480, 30),
+                (640, 480, 15),
+                (640, 480, 5),
+            ]
+        )
+
+    # De-duplicate while preserving order.
+    seen = set()
+    uniq: List[Tuple[int, int, int]] = []
+    for p in profiles:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return tuple(uniq)
 
 
 def _safe_wait_frames(pipeline: rs.pipeline, timeout_ms: int = 100) -> Optional[rs.frameset]:
@@ -125,12 +175,20 @@ def main() -> int:
     args = parser.parse_args()
 
     ctx = rs.context()
-    devices = list(ctx.devices)
+    devices = list(ctx.query_devices())
     if not devices:
         print("No RealSense device detected by librealsense.")
         return 2
 
     devices = devices[: args.max_cams]
+    serials = []
+    for dev in devices:
+        try:
+            serials.append(dev.get_info(rs.camera_info.serial_number))
+        except Exception:
+            serials.append("unknown")
+    print(f"Detected {len(devices)} camera(s): {', '.join(serials)}")
+
     cams: List[Dict[str, object]] = []
     for dev in devices:
         serial = dev.get_info(rs.camera_info.serial_number)
@@ -140,19 +198,23 @@ def main() -> int:
         except Exception:
             usb_desc = ""
 
-        if usb_desc.startswith("2"):
-            candidates = [15, 5, args.fps]
-        else:
-            candidates = [args.fps, 15, 5]
-        fps_candidates = tuple(dict.fromkeys(candidates))
-
-        pipeline, fps_used = _start_pipeline(
-            ctx=ctx,
-            serial=serial,
-            width=args.width,
-            height=args.height,
-            fps_candidates=fps_candidates,
+        profiles = _build_profiles(
+            req_width=args.width,
+            req_height=args.height,
+            req_fps=args.fps,
+            usb_desc=usb_desc,
+            total_cams=len(devices),
         )
+        try:
+            pipeline, (stream_w, stream_h, fps_used) = _start_pipeline(
+                ctx=ctx,
+                serial=serial,
+                profiles=profiles,
+            )
+        except Exception as e:
+            print(f"[ERROR] Could not start {serial}: {type(e).__name__}: {e}")
+            continue
+
         cams.append(
             {
                 "serial": serial,
@@ -160,10 +222,20 @@ def main() -> int:
                 "pipeline": pipeline,
                 "align": rs.align(rs.stream.color),
                 "fps": fps_used,
+                "stream_w": stream_w,
+                "stream_h": stream_h,
                 "last_panel": _empty_panel(args.width, args.height, f"{serial} (waiting)"),
             }
         )
-        print(f"Started {serial} usb={usb_desc or 'unknown'} at {args.width}x{args.height}@{fps_used}")
+        print(
+            f"Started {serial} usb={usb_desc or 'unknown'} "
+            f"at {stream_w}x{stream_h}@{fps_used}"
+        )
+
+    if not cams:
+        print("Failed to start any camera.")
+        return 3
+    print(f"Running with {len(cams)} camera(s).")
 
     panel_h = args.height * 2
     panel_w = args.width
@@ -181,7 +253,18 @@ def main() -> int:
                     if depth and color:
                         color_np = np.asanyarray(color.get_data())
                         depth_np = np.asanyarray(depth.get_data())
-                        label = f"{cam['serial']} usb={cam['usb']} @{cam['fps']}fps"
+                        if color_np.shape[1] != args.width or color_np.shape[0] != args.height:
+                            color_np = cv2.resize(
+                                color_np, (args.width, args.height), interpolation=cv2.INTER_LINEAR
+                            )
+                        if depth_np.shape[1] != args.width or depth_np.shape[0] != args.height:
+                            depth_np = cv2.resize(
+                                depth_np, (args.width, args.height), interpolation=cv2.INTER_NEAREST
+                            )
+                        label = (
+                            f"{cam['serial']} usb={cam['usb']} "
+                            f"{cam['stream_w']}x{cam['stream_h']}@{cam['fps']}fps"
+                        )
                         cam["last_panel"] = _make_panel(
                             color=color_np, depth=depth_np, label=label
                         )

@@ -25,8 +25,14 @@ class CameraSystem:
         self.fps = fps
 
         self.serial_numbers = SingleRealsense.get_connected_devices_serial()
-        self.num_cam = len(self.serial_numbers)
-        assert self.num_cam == num_cam, f"Only {self.num_cam} cameras are connected."
+        detected_num_cam = len(self.serial_numbers)
+        if num_cam is None:
+            self.num_cam = detected_num_cam
+        else:
+            assert (
+                detected_num_cam == num_cam
+            ), f"Only {detected_num_cam} cameras are connected."
+            self.num_cam = num_cam
 
         self.shm_manager = SharedMemoryManager()
         self.shm_manager.start()
